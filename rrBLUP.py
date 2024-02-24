@@ -237,11 +237,12 @@ def A_mat(X, min_MAF = None, max_missing = None, impute_method = "mean", tol = 0
 import numpy as np
 import pandas as pd
 from scipy.optimize import fminbound
+from scipy.optimize import minimize_scalar
 from rpy2 import robjects
 from rpy2.robjects import numpy2ri
 numpy2ri.activate()
 import os
-
+from skopt import Optimizer
 def mixed_solve(y, Z = None, K = None, X = None, method = "REML",
            bounds = [1e-09, 1e+09], SE = False, return_Hinv = False):
     
@@ -459,6 +460,7 @@ def mixed_solve(y, Z = None, K = None, X = None, method = "REML",
         lambda_opt = list(tmp)[0]
         objective = list(tmp)[1]
         os.system('rm bounds.csv df.csv omega_sq.csv theta.csv')
+        print(f'lambda_opt is {lambda_opt}')
     Vu_opt = np.nansum(omega_sq.reshape(-1) / (theta + lambda_opt)) / df
     Ve_opt = lambda_opt * Vu_opt
     Hinv = np.dot(U, (np.transpose(U) / (phi + lambda_opt).reshape(-1,1)))
@@ -494,4 +496,270 @@ def mixed_solve(y, Z = None, K = None, X = None, method = "REML",
         else:
             result = {'Vu': Vu_opt, 'Ve': Ve_opt, "beta": beta, "beta_SE": beta_SE,
                        "u": u, "u_SE": u_SE, "LL": LL}
+            return result
+
+
+def mixed_solve_oddo(y, Z=None, K=None, X=None, method="REML",
+                     bounds=[1e-09, 1e+09], SE=False, return_Hinv=False):
+    '''
+    Parameters:
+    -----------
+    y [array]:
+        Vector of observations for n lines and 1 observation
+
+    Z [array, default = None]:
+        Design matrix of the random effects for n lines and m random effects, default to be the identity matrix
+
+    K [array, default = None]:
+        Covariance matrix of the random effects, if not passed, assumed to be the identity matrix
+
+    X [array, default = None]:
+        Design matrix of the fixed effects for n lines and p fixed effects, which should be full column rank,
+        default to be a vector of 1's
+
+    method [str("ML" or "REML"), default = "REML"]:
+        Method of maximum-likelihood used in algorithm, there are only two options, "ML" uses full maximum-likelihood
+        method and "REML" uses restricted maximum-likelihood method
+
+    bounds [list, default = [1e-09, 1e+09]]:
+        Lower and upper bound for the ridge parameter
+
+    SE [bool, default = False]:
+        whether to calculate and return standard errors
+
+    return.Hinv [bool, default = False]:
+        whether to return the inverse of H = Z*K*Z' + \lambda*I, which is useful for GWAS
+
+
+    Returns:
+    --------
+    Vu [float]:
+        Estimator for the marker variance \sigma^2_u
+
+    Ve [float]:
+        Estimator for the residual variance \sigma^2_e
+
+    beta [array]:
+        BLUE for the fixed effects \beta
+
+    u [array]:
+        BLUP for the random effects u
+
+    LL [float]:
+        maximized log-likelihood
+
+    (When SE = True)
+    beta.SE [float]:
+        Standard error for the fixed effects \beta
+
+    u.SE [float]:
+        Standard error for the random effects u
+
+    (When return_Hinv = True)
+    Hinv [array]:
+        Inverse of H = Z*K*Z' + \lambda*I
+    '''
+
+    def crossprod(A, B):
+        return np.dot(np.transpose(A), B)
+
+    def tcrossprod(A, B):
+        return np.dot(A, np.transpose(B))
+
+    if method not in ["ML", "REML"]:
+        print("Invalid maximum-likelihood method.")
+        return
+
+    pi = 3.14159
+    n = len(y)
+    not_nan = np.argwhere(y)[:, 0]
+    if X is None:
+        p = 1
+        X = np.ones((n, 1))
+    p = X.shape[1]
+    if not p:
+        p = 1
+        X = X.reshape(-1, 1)
+    if Z is None:
+        Z = np.eye(n)
+    m = Z.shape[1]
+    if not m:
+        m = 1
+        Z = Z.reshape(-1, 1)
+    if Z.shape[0] != n:
+        print("ERROR: Z.shape[0] != n")
+        return
+    if X.shape[0] != n:
+        print("ERROR: X.shape[0] != n")
+        return
+    if K is not None:
+        if K.shape[0] != m:
+            print("ERROR: K.shape[0] != m")
+            return
+        if K.shape[1] != m:
+            print("ERROR: K.shape[1] != m")
+            return
+    Z = Z[not_nan, :]
+    X = X[not_nan, :]
+    n = len(not_nan)
+    y = y[not_nan, :]
+    XtX = crossprod(X, X)
+    rank_X = np.linalg.matrix_rank(XtX)
+    if rank_X < p:
+        print("ERROR: X not full rank")
+        return
+    XtXinv = np.linalg.inv(XtX)
+    S = np.eye(n) - tcrossprod(np.dot(X, XtXinv), X)
+    if n <= m + p:
+        spectral_method = "eigen"
+    else:
+        spectral_method = "cholesky"
+        if K is not None:
+            K += np.diag([1e-06] * m)
+            try:
+                B = np.transpose(np.linalg.cholesky(K))
+            except:
+                print('ERROR: K not positive semi-definite')
+                return
+    if spectral_method == "cholesky":
+        if K is None:
+            ZBt = Z
+        else:
+            ZBt = tcrossprod(Z, B)
+        u, svd_ZBt_d, v = np.linalg.svd(Z, full_matrices=0)
+        phi = np.append(svd_ZBt_d * svd_ZBt_d, np.zeros(n - m))
+        SZBt = np.dot(S, ZBt)
+        try:
+            svd_SZBt_u, svd_SZBt_d, v = np.linalg.svd(SZBt, full_matrices=0)
+        except:
+            svd_SZBt_u, svd_SZBt_d, v = np.linalg.svd(SZBt + 1e-10, full_matrices=0)
+        matrix_to_decompose = np.hstack((X, svd_SZBt_u))
+        QR = robjects.r['qr'](matrix_to_decompose)
+        Q, R = np.linalg.qr(matrix_to_decompose)
+        # In Python, assuming Q is your orthogonal matrix from the QR decomposition
+        Q_transpose_Q = np.dot(Q.T, Q)
+        identity_matrix = np.eye(Q.shape[1])  # Generate an identity matrix of appropriate size
+
+        # Check if Q_transpose_Q is close to the identity matrix
+        is_orthogonal = np.allclose(Q_transpose_Q, identity_matrix, atol=1e-5)
+        print(f"Q is orthogonal: {is_orthogonal}")
+        # In Python, reconstruct the original matrix
+        reconstructed_matrix = np.dot(Q, R)
+
+        # Assuming original_matrix is the matrix you decomposed
+        original_matrix_close = np.allclose(reconstructed_matrix, matrix_to_decompose, atol=1e-5)
+        print(f"Reconstruction close to original: {original_matrix_close}")
+
+        q = robjects.r['qr.Q'](QR, complete=True)
+        r = robjects.r['qr.R'](QR)
+        Q = q[:, p:n]
+        R = r[p:m, p:m]
+
+        # Select specific parts of Q and R as per your R code, adjusted for zero-based indexing
+        Q_selected = Q[:, p:n]  # Assuming p and n are defined appropriately
+        R_selected = R[p:m, p:m]  # Assuming m is defined appropriately
+
+        try:
+            ans = np.linalg.solve(np.transpose(R * R), svd_SZBt_d * svd_SZBt_d)
+            theta = np.append(ans, np.zeros(n - p - m))
+        except:
+            spectral_method = "eigen"
+    if spectral_method == "eigen":
+        offset = np.sqrt(n)
+        if K is None:
+            Hb = tcrossprod(Z, Z) + offset * np.eye(n)
+        else:
+            Hb = tcrossprod(np.dot(Z, K), Z) + offset * np.eye(n)
+        tmp = robjects.r['eigen'](Hb)
+        #print(f'r temp {tmp}')
+        eigenvalues, eigenvectors = np.linalg.eig(Hb)
+        # Sort the eigenvalues in descending order, and sort the eigenvectors to match
+        idx = eigenvalues.argsort()[::-1]  # Get the indices that would sort the eigenvalues
+        sorted_eigenvalues = eigenvalues[idx]
+        sorted_eigenvectors = eigenvectors[:, idx]
+        Hb_system_values = sorted_eigenvalues
+        Hb_system_vectors = sorted_eigenvectors
+        #print(f'numpy eigenvalues: {eigenvalues}, r_system_values: {list(tmp)[0]}, numpy eigenvector: {eigenvectors},r_system_eigenvectors: {list(tmp)[1]}' )
+        for ind, value in enumerate(sorted_eigenvalues):
+            if abs(value - list(tmp)[0][ind] > 1e-5):
+                print(f'different eigenvalue: {value}, r_system_value: {list(tmp)[0][ind]}')
+                assert False
+        phi = Hb_system_values - offset
+        if np.nanmin(phi) < -1e-06:
+            print("K not positive semi-definite.")
+            return
+        U = Hb_system_vectors
+        SHbS = np.dot(np.dot(S, Hb), S)
+        eigenvalues, eigenvectors = np.linalg.eig(SHbS)
+        # Sort the eigenvalues in descending order, and sort the eigenvectors to match
+        idx = eigenvalues.argsort()[::-1]  # Get the indices that would sort the eigenvalues
+        sorted_eigenvalues = eigenvalues[idx]
+        sorted_eigenvectors = eigenvectors[:, idx]
+        tmp = robjects.r['eigen'](SHbS)
+        SHbS_system_values = sorted_eigenvalues
+        SHbS_system_vectors = sorted_eigenvectors
+        for ind, value in enumerate(sorted_eigenvalues):
+            if abs(value - list(tmp)[0][ind] > 1e-5):
+                print(f'different eigenvalue: {value}, r_system_value: {list(tmp)[0][ind]}')
+                assert False
+        #print( f'numpy eigenvalues: {eigenvalues}, r_system_values: {list(tmp)[0]}, numpy eigenvector: {eigenvectors},r_system_eigenvectors: {list(tmp)[1]}')
+        theta = SHbS_system_values[0:(n - p)] - offset
+        Q = SHbS_system_vectors[:, 0:(n - p)]
+    omega = crossprod(Q, y)
+    omega_sq = omega * omega
+    if method == 'ML':
+        df = n
+        def f_ML(Lambda):
+            return n * np.log(np.nansum(omega_sq.reshape(-1) / (theta + Lambda))) + np.nansum(np.log(phi + Lambda))
+        lambda_opt = fminbound(f_ML, bounds[0], bounds[1])
+        objective = f_ML(lambda_opt)
+        os.system('rm bounds.csv df.csv phi.csv theta.csv omega_sq.csv')
+    else:
+
+        df = n - p
+        def f_REML(Lambda):
+            return (n - p) * np.log(np.nansum(omega_sq.reshape(-1) / (theta + Lambda))) + np.nansum(np.log(theta + Lambda))
+        lambda_opt = fminbound(f_REML, bounds[0], bounds[1])
+        objective = f_REML(lambda_opt)
+        #result = minimize_scalar(f_REML, bounds=(bounds[0], bounds[1]), method='bounded')
+
+        #print('python result',result)
+        #lambda_opt = result['x']
+        #objective = result['fun']
+        print(f'python lambda: {lambda_opt}')
+    Vu_opt = np.nansum(omega_sq.reshape(-1) / (theta + lambda_opt)) / df
+    Ve_opt = lambda_opt * Vu_opt
+    Hinv = np.dot(U, (np.transpose(U) / (phi + lambda_opt).reshape(-1, 1)))
+    W = crossprod(X, np.dot(Hinv, X))
+    beta = np.linalg.solve(W, crossprod(X, np.dot(Hinv, y)))
+    if K is None:
+        KZt = np.transpose(Z)
+    else:
+        KZt = tcrossprod(K, Z)
+    KZt_Hinv = np.dot(KZt, Hinv)
+    u = np.dot(KZt_Hinv, (y - np.dot(X, beta)))
+    LL = -0.5 * (objective + df + df * np.log(2 * pi / df))
+    if not SE:
+        if return_Hinv:
+            result = {'Vu': Vu_opt, 'Ve': Ve_opt, "beta": beta, "u": u, "LL": LL, "Hinv": Hinv}
+            return result
+        else:
+            result = {'Vu': Vu_opt, 'Ve': Ve_opt, "beta": beta, "u": u, "LL": LL}
+            return result
+    else:
+        Winv = np.linalg.inv(W)
+        beta_SE = np.sqrt(Vu_opt * np.diag(Winv))
+        WW = tcrossprod(KZt_Hinv, KZt)
+        WWW = np.dot(KZt_Hinv, X)
+        if K is None:
+            u_SE = np.sqrt(Vu_opt * (np.ones(m) - np.diag(WW) + np.diag(tcrossprod(np.dot(WWW, Winv), WWW))))
+        else:
+            u_SE = np.sqrt(Vu_opt * (np.diag(K) - np.diag(WW) + np.diag(tcrossprod(np.dot(WWW, Winv), WWW))))
+        if return_Hinv:
+            result = {'Vu': Vu_opt, 'Ve': Ve_opt, "beta": beta, "beta_SE": beta_SE,
+                      "u": u, "u_SE": u_SE, "LL": LL, "Hinv": Hinv}
+            return result
+        else:
+            result = {'Vu': Vu_opt, 'Ve': Ve_opt, "beta": beta, "beta_SE": beta_SE,
+                      "u": u, "u_SE": u_SE, "LL": LL}
             return result
